@@ -56,7 +56,8 @@ def get_cinic10_dataloaders(
         num_workers=2,
         train_fraction=1.0,
         use_cutout=False,
-        is_contrastive=False
+        is_contrastive=False,
+        pretrained=False
 ):
     """
     Creates and returns DataLoaders for the CINIC-10 dataset.
@@ -68,42 +69,68 @@ def get_cinic10_dataloaders(
     - train_fraction (float): Fraction of the training set to keep (for few-shot learning).
     - use_cutout (bool): Whether to apply the Cutout augmentation.
     - is_contrastive (bool): Whether to return two augmented views for contrastive learning.
+    - pretrained (bool): If True, resizes images to 224x224 and applies ImageNet normalization.
     """
 
-    # Official CINIC-10 normalization values
-    cinic_mean = [0.47889522, 0.4722784, 0.43047404]
-    cinic_std = [0.24205776, 0.23828046, 0.25874835]
+    # --- Configuration based on model type ---
+    if pretrained:
+        # Standard ImageNet normalization values
+        norm_mean = [0.485, 0.456, 0.406]
+        norm_std = [0.229, 0.224, 0.225]
+        target_size = 224
+    else:
+        # Official CINIC-10 normalization values
+        norm_mean = [0.47889522, 0.4722784, 0.43047404]
+        norm_std = [0.24205776, 0.23828046, 0.25874835]
+        target_size = 32
 
     # --- Data Augmentation Pipeline ---
+    train_transform_list = []
+    test_transform_list = []
 
-    # 1. Standard Operations: Random Crop, Horizontal Flip, Rotation
-    train_transform_list = [
-        transforms.RandomCrop(32, padding=4),
+    # 1. Resizing (Only needed for pretrained models)
+    if pretrained:
+        # Standard practice for ImageNet models: resize to 256, then crop to 224
+        train_transform_list.extend([
+            transforms.Resize(256),
+            transforms.RandomCrop(target_size)
+        ])
+        test_transform_list.extend([
+            transforms.Resize(256),
+            transforms.CenterCrop(target_size)
+        ])
+    else:
+        # Standard practice for 32x32 images
+        train_transform_list.append(transforms.RandomCrop(target_size, padding=4))
+        # No resizing needed for test_transform_list in 32x32 mode
+
+    # 2. Standard Operations: Horizontal Flip, Rotation
+    train_transform_list.extend([
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15),
         transforms.ToTensor(),
-        transforms.Normalize(mean=cinic_mean, std=cinic_std)
-    ]
+        transforms.Normalize(mean=norm_mean, std=norm_std)
+    ])
 
-    # 2. Advanced Technique: Cutout (RandomErasing in PyTorch)
-    # Note: RandomErasing must be applied AFTER ToTensor()
+    # 3. Test/Valid Pipeline completion
+    test_transform_list.extend([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=norm_mean, std=norm_std)
+    ])
+
+    # 4. Advanced Technique: Cutout (RandomErasing in PyTorch)
     if use_cutout:
         # scale defines the proportion of image to erase, ratio defines aspect ratio of erased region
         train_transform_list.append(transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3)))
 
     base_train_transforms = transforms.Compose(train_transform_list)
+    test_transforms = transforms.Compose(test_transform_list)
 
     # Wrap the base transform for Contrastive Learning if required
     if is_contrastive:
         train_transforms = TwoCropTransform(base_train_transforms)
     else:
         train_transforms = base_train_transforms
-
-    # Validation and Test transforms (NO augmentation, just normalization)
-    test_transforms = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=cinic_mean, std=cinic_std)
-    ])
 
     # --- Load Datasets ---
     train_dir = os.path.join(data_dir, 'train')
@@ -115,22 +142,22 @@ def get_cinic10_dataloaders(
     test_dataset = datasets.ImageFolder(root=test_dir, transform=test_transforms)
 
     # --- Dataset Reduction for Few-Shot Learning ---
-    # Drastically reduce the size of the training set if train_fraction < 1.0
     if train_fraction < 1.0:
         dataset_size = len(train_dataset)
         subset_size = int(dataset_size * train_fraction)
-
-        # Generate random indices for the subset
         indices = torch.randperm(dataset_size)[:subset_size].tolist()
         train_dataset = Subset(train_dataset, indices)
         print(f"[*] Training dataset reduced to {subset_size} samples (fraction: {train_fraction}).")
 
     # --- Create DataLoaders ---
+    # Automatically disable pin_memory for MPS (Mac) to avoid warnings, enable for CUDA
+    use_pin_memory = torch.cuda.is_available()
+
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                              pin_memory=True)
+                              pin_memory=use_pin_memory)
     valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                              pin_memory=True)
+                              pin_memory=use_pin_memory)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                             pin_memory=True)
+                             pin_memory=use_pin_memory)
 
     return train_loader, valid_loader, test_loader

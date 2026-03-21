@@ -1,8 +1,14 @@
 import os
+import sys
 import torch
 import torchvision
 import matplotlib.pyplot as plt
 import numpy as np
+
+# Add the project root directory to Python's path so the "Run" button works
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
 # Import the dataloader function from your previous file
 # (Make sure the previous code is saved as data_loader.py in the same folder)
@@ -68,7 +74,10 @@ if __name__ == "__main__":
     set_seed(42)
 
     # Path to your dataset
-    DATA_PATH = "../data"
+    # We use os.path.join with the file's current location to always find the data folder
+    # no matter where we run the script from.
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    DATA_PATH = os.path.join(current_dir, "..", "..", "data")
 
     if os.path.exists(DATA_PATH):
         print("Loading DataLoaders...")

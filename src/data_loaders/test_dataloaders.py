@@ -74,10 +74,9 @@ if __name__ == "__main__":
     set_seed(42)
 
     # Path to your dataset
-    # We use os.path.join with the file's current location to always find the data folder
-    # no matter where we run the script from.
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    DATA_PATH = os.path.join(current_dir, "..", "..", "data")
+    # We use the project_root derived at the top of this file to ensure
+    # both paths (imports and dataset) resolve using the same logic.
+    DATA_PATH = os.path.join(project_root, "data")
 
     if os.path.exists(DATA_PATH):
         print("Loading DataLoaders...")

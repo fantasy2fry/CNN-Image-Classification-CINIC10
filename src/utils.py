@@ -53,7 +53,7 @@ class TwoCropTransform:
 def get_cinic10_dataloaders(
         data_dir,
         batch_size=128,
-        num_workers=2,
+        num_workers=0,
         train_fraction=1.0,
         use_cutout=False,
         is_contrastive=False,

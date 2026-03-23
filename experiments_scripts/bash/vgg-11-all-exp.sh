@@ -6,7 +6,7 @@ set -e
 # Zmienne ogólne
 EPOCHS=30
 # Podmień "src.train_macos" na dokładną nazwę Twojego pliku Python
-SCRIPT="python -m src.train_macos"
+SCRIPT="python -m src.train"
 
 echo "=================================================="
 echo " Uruchamiam nocną serię eksperymentów dla VGG-11! "

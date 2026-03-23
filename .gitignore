@@ -356,5 +356,8 @@ data/*
 models/*
 !models/.gitkeep
 
+experiments/*
+!experiments/.gitkeep
+
 plots/*
 !plots/.gitkeep

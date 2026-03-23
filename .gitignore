@@ -358,3 +358,6 @@ models/*
 
 experiments/*
 !experiments/.gitkeep
+
+plots/*
+!plots/.gitkeep

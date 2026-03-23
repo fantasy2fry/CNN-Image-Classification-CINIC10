@@ -5,7 +5,7 @@ set -e
 
 # Zmienne ogólne
 EPOCHS=30
-SCRIPT="python -m src.train_macos"
+SCRIPT="python -m src.train"
 
 echo "======================================================"
 echo " Uruchamiam serię eksperymentów dla ResNet-34! "

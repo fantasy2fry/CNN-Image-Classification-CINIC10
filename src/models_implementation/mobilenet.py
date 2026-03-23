@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 import torch.nn as nn
 from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
 

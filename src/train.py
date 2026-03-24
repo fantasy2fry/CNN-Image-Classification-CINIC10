@@ -89,6 +89,14 @@ def main():
     parser.add_argument('--use_cutout', action='store_true', help='Enable Cutout Data Augmentation')
     parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'sgd'],
                         help='Optimizer to use')
+    parser.add_argument('--samples_per_class', type=int, default=None,
+                        help='Exact number of images per class for Few-Shot Learning')
+    parser.add_argument('--disable_crop', action='store_true',
+                        help='Disable Random Crop augmentation')
+    parser.add_argument('--disable_flip', action='store_true',
+                        help='Disable Random Horizontal Flip augmentation')
+    parser.add_argument('--disable_rotation', action='store_true',
+                        help='Disable Random Rotation augmentation')
     
     args = parser.parse_args()
 
@@ -139,6 +147,10 @@ def main():
         data_dir=data_dir,
         batch_size=args.batch_size,
         num_workers=0,
+        samples_per_class=args.samples_per_class,
+        use_crop=not args.disable_crop,
+        use_horizontal_flip=not args.disable_flip,
+        use_rotation=not args.disable_rotation,
         use_cutout=args.use_cutout,
         pretrained=is_pretrained_model
     )

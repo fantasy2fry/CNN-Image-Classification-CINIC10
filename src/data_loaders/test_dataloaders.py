@@ -88,9 +88,21 @@ if __name__ == "__main__":
         train_loader, valid_loader, test_loader = get_cinic10_dataloaders(
             data_dir=DATA_PATH,
             batch_size=32,  # Smaller batch size just for visualization
-            num_workers=2,
-            use_cutout=False  # Turn off cutout just to see original images clearly
+            num_workers=0,
+            use_cutout=True,  # Turn off cutout just to see original images clearly
+            pretrained=True,
+            samples_per_class=10
         )
+
+        # show number of data in each loader
+        print(f"Number of images in training set: {len(train_loader.dataset)}")
+        print(f"Number of images in validation set: {len(valid_loader.dataset)}")
+        print(f"Number of images in test set: {len(test_loader.dataset)}")
+
+        # If you also want to see the number of batches:
+        print(f"Number of training batches: {len(train_loader)}")
+        print(f"Number of validation batches: {len(valid_loader)}")
+        print(f"Number of test batches: {len(test_loader)}")
 
         print("Displaying a batch of images...")
         show_batch_images(train_loader, num_images=8)

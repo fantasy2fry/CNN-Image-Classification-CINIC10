@@ -88,8 +88,9 @@ if __name__ == "__main__":
         train_loader, valid_loader, test_loader = get_cinic10_dataloaders(
             data_dir=DATA_PATH,
             batch_size=32,  # Smaller batch size just for visualization
-            num_workers=2,
-            use_cutout=False  # Turn off cutout just to see original images clearly
+            num_workers=0,
+            use_cutout=True,  # Turn off cutout just to see original images clearly
+            pretrained=True
         )
 
         print("Displaying a batch of images...")

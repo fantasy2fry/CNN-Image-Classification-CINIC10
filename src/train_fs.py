@@ -30,6 +30,14 @@ from src.models_implementation.fs_contrastive import ContrastiveModel, TripletLo
 # ==========================================
 KNN_EVAL_EVERY = 5
 
+# ==========================================
+# Number of validation batches used for the fast per-epoch loss estimate.
+# Full valid set (~90k images, 704 batches) is too slow to run every epoch.
+# We sample a small fixed subset for a quick proxy metric during training.
+# Full k-NN evaluation is always performed at the end on the test set.
+# ==========================================
+FAST_EVAL_BATCHES = 20   # 20 batches x 128 = ~2560 images — fast proxy
+
 
 def get_knn_accuracy(model, train_loader, test_loader, device, k=5):
     """
@@ -72,60 +80,45 @@ def get_knn_accuracy(model, train_loader, test_loader, device, k=5):
             images = inputs.to(device)
             labels = labels.to(device)
 
-            # Shape: [B, embedding_dim]
-            test_emb = model(images)
-
-            # Pairwise L2 distances between every test embedding and every support embedding
-            # Shape: [B, N_support]
+            # Pairwise L2 distances: Shape [B, N_support]
+            test_emb  = model(images)
             distances = torch.cdist(test_emb, train_embeddings, p=2)
 
-            # Indices of the k nearest neighbors (smallest distances)
-            # Shape: [B, k]
+            # Indices of the k nearest neighbors (smallest distances): Shape [B, k]
             _, knn_indices = distances.topk(k, dim=1, largest=False)
 
-            # Gather the labels of the k nearest neighbors
-            knn_labels = train_labels[knn_indices]   # Shape: [B, k]
-
             # Majority vote: pick the most frequent label per test sample
+            knn_labels   = train_labels[knn_indices]
             predictions, _ = torch.mode(knn_labels, dim=1)
 
             correct += (predictions == labels).sum().item()
-            total += labels.size(0)
+            total   += labels.size(0)
 
-    accuracy = correct / total
-    return accuracy
+    return correct / total
 
 
 def get_negatives(view, labels):
     """
-    For each sample i in the batch, selects a random sample j from the same batch
-    such that labels[j] != labels[i]. This sample serves as the 'negative' in
-    the Triplet Loss (anchor=view[i], positive=another view of i, negative=view[j]).
+    For each sample i in the batch, selects a random sample j such that
+    labels[j] != labels[i] to serve as the triplet negative.
 
-    Vectorized approach: we build the full [B, B] label-difference mask once and
-    then sample from it, avoiding repeated Python-level calls to nonzero().
+    Vectorized: builds the full [B, B] label-difference mask once before
+    the loop, avoiding repeated nonzero() calls per sample.
 
-    Fallback: if the entire batch contains only one class, we use the cyclically
-    shifted sample as a pseudo-negative (loss will be non-informative but training
-    won't crash).
+    Fallback: cyclic shift when all batch samples share the same class.
     """
     B = view.shape[0]
 
-    # diff_mask[i, j] = True  iff  labels[i] != labels[j]
-    # Shape: [B, B]
+    # diff_mask[i, j] = True  iff  labels[i] != labels[j]  — Shape: [B, B]
     diff_mask = labels.unsqueeze(0) != labels.unsqueeze(1)
 
     negatives = torch.zeros_like(view)
-
     for i in range(B):
         diff_idx = diff_mask[i].nonzero(as_tuple=True)[0]
         if len(diff_idx) > 0:
-            rand_pick = torch.randint(len(diff_idx), (1,))
-            neg_idx = diff_idx[rand_pick].item()
+            neg_idx = diff_idx[torch.randint(len(diff_idx), (1,))].item()
         else:
-            # Fallback: cyclic shift — batch is single-class, no true negative available
-            neg_idx = (i + 1) % B
-
+            neg_idx = (i + 1) % B   # fallback: single-class batch
         negatives[i] = view[neg_idx]
 
     return negatives
@@ -133,16 +126,10 @@ def get_negatives(view, labels):
 
 def train_contrastive_epoch(model, dataloader, criterion, optimizer, device):
     """
-    Runs one full training epoch for the contrastive (triplet) setup.
-
-    Each batch yields two augmented views of the same images (view1, view2).
-      - anchor  : view1
-      - positive: view2  (same image, different augmentation -> should be close)
-      - negative: a sample from the batch with a different class label (should be far)
-
-    Returns:
-        epoch_loss (float): average triplet loss over all samples.
-        0.0: placeholder for accuracy (undefined in the triplet metric space).
+    One full training epoch using TripletLoss.
+      - anchor  : view1 (first augmented view)
+      - positive: view2 (second augmented view of the same image)
+      - negative: in-batch sample with a different class label
     """
     model.train()
     running_loss = 0.0
@@ -150,66 +137,55 @@ def train_contrastive_epoch(model, dataloader, criterion, optimizer, device):
 
     loop = tqdm(dataloader, leave=False, desc="Train Contrastive")
     for inputs, labels in loop:
-        # inputs is [view1, view2] because is_contrastive=True in the dataloader
         view1, view2 = inputs[0].to(device), inputs[1].to(device)
         labels = labels.to(device)
 
-        # Mine negatives from the current batch (in-batch negative mining)
         negatives = get_negatives(view1, labels).to(device)
 
         optimizer.zero_grad()
 
-        # Forward pass: compute L2-normalized embeddings for all three roles
-        anchor_emb   = model(view1)
-        pos_emb      = model(view2)
-        neg_emb      = model(negatives)
+        anchor_emb = model(view1)
+        pos_emb    = model(view2)
+        neg_emb    = model(negatives)
 
-        # Triplet Loss: max(0, d(anchor, pos) - d(anchor, neg) + margin)
         loss = criterion(anchor_emb, pos_emb, neg_emb)
-
         loss.backward()
         optimizer.step()
 
         running_loss += loss.item() * view1.size(0)
         total += view1.size(0)
-
         loop.set_postfix(loss=(running_loss / total))
 
-    epoch_loss = running_loss / total
-    # Accuracy is not directly defined for triplet training; return 0.0 as placeholder
-    return epoch_loss, 0.0
+    return running_loss / total, 0.0
 
 
-def evaluate_contrastive(model, dataloader, criterion, device):
+def evaluate_contrastive_fast(model, dataloader, criterion, device, max_batches=FAST_EVAL_BATCHES):
     """
-    Evaluates the contrastive model on a validation set (triplet loss only).
+    Fast per-epoch validation proxy: evaluates triplet loss over a small fixed
+    number of batches instead of the full validation set (~90k images / 704 batches).
 
-    Handles both contrastive dataloaders (inputs = [view1, view2]) and
-    standard dataloaders (inputs = tensor). For standard loaders the same
-    image is used as both anchor and positive — the loss won't be meaningful,
-    but lets us reuse this function for monitoring.
+    This is purely a training monitor — NOT used as the final accuracy metric.
+    The definitive evaluation is always k-NN on the full test set at the end.
 
-    Returns:
-        epoch_loss (float): average triplet loss.
-        0.0: placeholder for accuracy.
+    Args:
+        max_batches: number of batches to process (None = full dataloader, slow).
     """
     model.eval()
     running_loss = 0.0
     total = 0
 
-    loop = tqdm(dataloader, leave=False, desc="Eval Contrastive")
     with torch.no_grad():
-        for inputs, labels in loop:
+        for batch_idx, (inputs, labels) in enumerate(dataloader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
             if isinstance(inputs, list):
-                # Contrastive loader: two independently augmented views
                 view1, view2 = inputs[0].to(device), inputs[1].to(device)
             else:
-                # Standard loader: use the same image as a dummy positive
                 view1 = inputs.to(device)
-                view2 = view1
+                view2 = view1   # dummy positive for standard loaders
 
-            labels = labels.to(device)
-
+            labels    = labels.to(device)
             negatives = get_negatives(view1, labels).to(device)
 
             anchor_emb = model(view1)
@@ -221,67 +197,50 @@ def evaluate_contrastive(model, dataloader, criterion, device):
             running_loss += loss.item() * view1.size(0)
             total += view1.size(0)
 
-            loop.set_postfix(loss=(running_loss / total))
-
-    epoch_loss = running_loss / total
-    return epoch_loss, 0.0
+    return (running_loss / total if total > 0 else 0.0), 0.0
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train Few-Shot / Contrastive on CINIC-10")
     parser.add_argument('--model', type=str, default='mobilenet',
-                        choices=['cnn', 'mobilenet', 'vgg11', 'resnet34'],
-                        help='Model architecture to use as the backbone')
+                        choices=['cnn', 'mobilenet', 'vgg11', 'resnet34'])
     parser.add_argument('--freeze_features', action='store_true',
-                        help='Freeze the backbone feature extractor (only the projection head trains)')
-
-    parser.add_argument('--epochs', type=int, default=10,
-                        help='Total number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=128,
-                        help='Mini-batch size')
-    parser.add_argument('--lr', type=float, default=0.001,
-                        help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.0,
-                        help='L2 weight decay (regularization strength)')
-    parser.add_argument('--dropout', type=float, default=0.5,
-                        help='Dropout probability (applies to VGG-11 and Custom CNN)')
-    parser.add_argument('--use_cutout', action='store_true',
-                        help='Enable Cutout (RandomErasing) data augmentation')
-    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'sgd'],
-                        help='Optimizer')
-
-    # Few-Shot specific
+                        help='Freeze the backbone; only the projection head trains')
+    parser.add_argument('--epochs',       type=int,   default=10)
+    parser.add_argument('--batch_size',   type=int,   default=128)
+    parser.add_argument('--lr',           type=float, default=0.001)
+    parser.add_argument('--weight_decay', type=float, default=0.0)
+    parser.add_argument('--dropout',      type=float, default=0.5,
+                        help='Dropout probability (VGG-11 and Custom CNN only)')
+    parser.add_argument('--use_cutout',   action='store_true')
+    parser.add_argument('--optimizer',    type=str,   default='adam', choices=['adam', 'sgd'])
     parser.add_argument('--samples_per_class', type=int, default=None,
-                        help='Number of images per class (enables few-shot mode)')
-
-    # Augmentation ablation flags
-    parser.add_argument('--disable_crop',     action='store_true', help='Disable RandomCrop augmentation')
-    parser.add_argument('--disable_flip',     action='store_true', help='Disable RandomHorizontalFlip augmentation')
-    parser.add_argument('--disable_rotation', action='store_true', help='Disable RandomRotation augmentation')
-
-    # Triplet Loss margin
-    parser.add_argument('--margin', type=float, default=1.0,
-                        help='Margin for TripletLoss (how far negatives must be pushed)')
-
-    # k-NN evaluation frequency
-    parser.add_argument('--knn_every', type=int, default=KNN_EVAL_EVERY,
-                        help='Run k-NN accuracy evaluation every N epochs (default: 5). '
-                             'Set to 1 to evaluate every epoch (slow).')
-
+                        help='Images per class — enables few-shot mode')
+    parser.add_argument('--disable_crop',     action='store_true')
+    parser.add_argument('--disable_flip',     action='store_true')
+    parser.add_argument('--disable_rotation', action='store_true')
+    parser.add_argument('--margin',           type=float, default=1.0,
+                        help='Margin for TripletLoss')
+    parser.add_argument('--knn_every',        type=int, default=KNN_EVAL_EVERY,
+                        help='Run k-NN evaluation every N epochs (default: 5)')
+    parser.add_argument('--fast_eval_batches', type=int, default=FAST_EVAL_BATCHES,
+                        help='Val batches for fast per-epoch proxy loss (0 = full val set, slow)')
     args = parser.parse_args()
 
     # -----------------------------------------------------------------------
     # Paths
     # -----------------------------------------------------------------------
-    project_root   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    data_dir       = os.path.join(project_root, "data")
+    project_root    = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    data_dir        = os.path.join(project_root, "data")
     experiments_dir = os.path.join(project_root, "experiments")
-    models_dir     = os.path.join(project_root, "models")
+    models_dir      = os.path.join(project_root, "models")
     os.makedirs(experiments_dir, exist_ok=True)
     os.makedirs(models_dir, exist_ok=True)
 
+    fast_eval_batches = args.fast_eval_batches if args.fast_eval_batches > 0 else None
+
     # -----------------------------------------------------------------------
-    # Experiment filename — encodes all relevant hyperparameters
+    # Experiment filename
     # -----------------------------------------------------------------------
     filename = (
         f"CONTRASTIVE_{args.model.upper()}_{args.optimizer}_"
@@ -304,9 +263,8 @@ def main():
     filename += ".csv"
 
     csv_path = os.path.join(experiments_dir, filename)
-
     if os.path.exists(csv_path):
-        print(f"[*] SKIP: Results for '{filename}' already exist. Delete the file to re-run.")
+        print(f"[*] SKIP: '{filename}' already exists. Delete to re-run.")
         return
 
     # -----------------------------------------------------------------------
@@ -314,17 +272,14 @@ def main():
     # -----------------------------------------------------------------------
     set_seed(42)
     device = torch.device(
-        'cuda'  if torch.cuda.is_available() else
-        'mps'   if torch.backends.mps.is_available() else
+        'cuda' if torch.cuda.is_available() else
+        'mps'  if torch.backends.mps.is_available() else
         'cpu'
     )
     print(f"[*] Running on device: {device}")
 
     # -----------------------------------------------------------------------
     # Dataloaders
-    # is_contrastive=True wraps train_loader with TwoCropTransform so that
-    # each batch returns [view1, view2] — two differently augmented versions
-    # of the same images. valid_loader and test_loader remain standard.
     # -----------------------------------------------------------------------
     is_pretrained_model = args.model in ['resnet34', 'mobilenet']
 
@@ -337,57 +292,44 @@ def main():
         use_horizontal_flip=not args.disable_flip,
         use_rotation=not args.disable_rotation,
         use_cutout=args.use_cutout,
-        is_contrastive=True,        # <-- critical: enables TwoCropTransform
+        is_contrastive=True,        # enables TwoCropTransform on train_loader only
         pretrained=is_pretrained_model
     )
 
     # -----------------------------------------------------------------------
-    # Backbone initialization
-    # The final classification head of each backbone is replaced with
-    # nn.Identity() to expose raw feature vectors, which are then fed
-    # into the ContrastiveModel's projection head.
+    # Backbone — replace final classifier with Identity to expose features
     # -----------------------------------------------------------------------
     print(f"[*] Initializing backbone: {args.model.upper()}")
 
     if args.model == 'vgg11':
         backbone = VGG11(num_classes=10, dropout_rate=args.dropout)
-        # Remove the 7-th (index 6) FC layer (the 10-class classifier)
         backbone.classifier[6] = nn.Identity()
         in_features = 4096
-
     elif args.model == 'resnet34':
         backbone = FinetunedResNet34(num_classes=10, freeze_features=args.freeze_features)
         backbone.model.fc = nn.Identity()
         in_features = 512
-
     elif args.model == 'mobilenet':
         backbone = get_finetuned_mobilenet(num_classes=10, freeze_features=args.freeze_features)
-        # MobileNetV2 classifier is nn.Sequential([Dropout,] Linear).
-        # We zero out only the linear part (index 0 when Dropout is commented out).
         backbone.classifier[0] = nn.Identity()
         in_features = 1280
-
     elif args.model == 'cnn':
         backbone = CustomCNN(num_classes=10, dropout_rate=args.dropout)
-        # Assume the last layer is the classifier; replace it
         backbone.fc = nn.Identity()
-        in_features = 512  # adjust if CustomCNN differs
+        in_features = 512
 
-    # Wrap the backbone in the ContrastiveModel:
-    # backbone -> projection head (Linear 128-d) -> L2 normalize
+    # backbone -> Linear(in_features, 128) -> L2 normalize
     model = ContrastiveModel(backbone=backbone, in_features=in_features, embedding_dim=128)
     model = model.to(device)
 
-    total_params     = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[*] Total parameters: {total_params:,} | Trainable: {trainable_params:,}")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(f"[*] Parameters — Total: {total:,} | Trainable: {trainable:,}")
 
     # -----------------------------------------------------------------------
     # Loss & Optimizer
     # -----------------------------------------------------------------------
-    criterion = TripletLoss(margin=args.margin)
-
-    # Only pass parameters that require gradients (respects freeze_features)
+    criterion  = TripletLoss(margin=args.margin)
     opt_params = filter(lambda p: p.requires_grad, model.parameters())
 
     if args.optimizer == 'sgd':
@@ -402,23 +344,23 @@ def main():
     print(
         f"[*] Starting Contrastive Training | Model: {args.model.upper()} | "
         f"Optimizer: {args.optimizer.upper()} | Epochs: {args.epochs} | "
-        f"Margin: {args.margin} | k-NN every: {args.knn_every} epochs"
+        f"Margin: {args.margin} | k-NN every: {args.knn_every} epochs | "
+        f"Fast eval batches: {fast_eval_batches if fast_eval_batches else 'ALL (slow)'}"
     )
     start_time = time.time()
-
-    last_val_knn_acc = float('nan')   # cache the last known k-NN accuracy
+    last_val_knn_acc = float('nan')
 
     for epoch in range(args.epochs):
         epoch_start = time.time()
 
         train_loss, _ = train_contrastive_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss,   _ = evaluate_contrastive(model, valid_loader, criterion, device)
 
-        # ----------------------------------------------------------------
-        # k-NN evaluation: run every `knn_every` epochs and on the last epoch.
-        # This is the most expensive step — it requires a full forward pass
-        # over the support set to build the embedding index.
-        # ----------------------------------------------------------------
+        # Fast proxy: only FAST_EVAL_BATCHES batches — avoids scanning 90k val images each epoch
+        val_loss, _ = evaluate_contrastive_fast(
+            model, valid_loader, criterion, device, max_batches=fast_eval_batches
+        )
+
+        # Full k-NN on valid: runs every knn_every epochs and always on the last epoch
         is_last_epoch = (epoch + 1 == args.epochs)
         run_knn = ((epoch + 1) % args.knn_every == 0) or is_last_epoch
 
@@ -426,16 +368,13 @@ def main():
             val_knn_acc      = get_knn_accuracy(model, train_loader, valid_loader, device, k=5)
             last_val_knn_acc = val_knn_acc
         else:
-            # Use the last computed value so the CSV doesn't have NaNs in early rows
-            val_knn_acc = last_val_knn_acc
+            val_knn_acc = last_val_knn_acc   # carry forward last known value
 
         epoch_time = time.time() - epoch_start
         knn_marker = " [k-NN]" if run_knn else ""
         print(
-            f"Epoch {epoch + 1:02d}/{args.epochs} | "
-            f"Time: {epoch_time:.1f}s | "
-            f"Train Loss: {train_loss:.4f} | "
-            f"Val Loss: {val_loss:.4f} | "
+            f"Epoch {epoch + 1:02d}/{args.epochs} | Time: {epoch_time:.1f}s | "
+            f"Train Loss: {train_loss:.4f} | Val Loss (fast): {val_loss:.4f} | "
             f"Val k-NN Acc: {val_knn_acc:.4f}{knn_marker}"
         )
 
@@ -452,27 +391,22 @@ def main():
     print(f"[*] Training finished in {total_time / 60:.2f} minutes.")
 
     # -----------------------------------------------------------------------
-    # Final evaluation on TEST set using k-NN
-    # This is the definitive metric: how well do the learned embeddings
-    # generalise to unseen test images when classified by nearest neighbors
-    # in the support (train) embedding space.
+    # Final definitive evaluation: 5-NN on full TEST set
     # -----------------------------------------------------------------------
     print(f"\n[*] Final evaluation: 5-NN on TEST set...")
     final_knn_acc = get_knn_accuracy(model, train_loader, test_loader, device, k=5)
     print(f"[*] FINAL k-NN TEST ACCURACY: {final_knn_acc:.4f}\n")
 
-    # Overwrite the last epoch's accuracy with the true test accuracy
     results[-1]['Accuracy'] = final_knn_acc
 
     # -----------------------------------------------------------------------
-    # Save results CSV and model weights
+    # Save CSV and model weights
     # -----------------------------------------------------------------------
     df = pd.DataFrame(results)
     df.to_csv(csv_path, index=False)
     print(f"[*] Results saved to: {csv_path}")
 
-    model_filename = filename.replace('.csv', '.pth')
-    model_path = os.path.join(models_dir, model_filename)
+    model_path = os.path.join(models_dir, filename.replace('.csv', '.pth'))
     torch.save(model.state_dict(), model_path)
     print(f"[*] Model weights saved to: {model_path}")
 

@@ -123,6 +123,18 @@ def main():
         filename += f"{args.weight_decay}_L2_"
     if args.use_cutout:
         filename += "Cutout_"
+
+    # --- Few-Shot and Augmentation Tracking ---
+    if args.samples_per_class is not None:
+        filename += f"{args.samples_per_class}shots_"
+
+    if args.disable_crop:
+        filename += "NoCrop_"
+    if args.disable_flip:
+        filename += "NoFlip_"
+    if args.disable_rotation:
+        filename += "NoRot_"
+    # -----------------------------------------------
     filename += ".csv"
 
     csv_path = os.path.join(experiments_dir, filename)

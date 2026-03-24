@@ -54,7 +54,10 @@ def get_cinic10_dataloaders(
         data_dir,
         batch_size=128,
         num_workers=0,
-        train_fraction=1.0,
+        samples_per_class=None,
+        use_crop=True,
+        use_horizontal_flip=True,
+        use_rotation=True,
         use_cutout=False,
         is_contrastive=False,
         pretrained=False
@@ -65,9 +68,12 @@ def get_cinic10_dataloaders(
     Args:
     - data_dir (str): Path to the extracted CINIC-10 dataset.
     - batch_size (int): Size of the batch.
-    - num_workers (int): Number of subprocesses to use for data loading, for macOS we should set num_workers=0.
-    - train_fraction (float): Fraction of the training set to keep (for few-shot learning).
-    - use_cutout (bool): Whether to apply the Cutout augmentation.
+    - num_workers (int): Number of subprocesses to use for data loading (0 for macOS).
+    - samples_per_class (int): Exact number of images per class for balanced Few-Shot Learning.
+    - use_crop (bool): Whether to apply Random Crop augmentation.
+    - use_horizontal_flip (bool): Whether to apply Random Horizontal Flip augmentation.
+    - use_rotation (bool): Whether to apply Random Rotation augmentation.
+    - use_cutout (bool): Whether to apply the Cutout (Random Erasing) augmentation.
     - is_contrastive (bool): Whether to return two augmented views for contrastive learning.
     - pretrained (bool): If True, resizes images to 224x224 and applies ImageNet normalization.
     """
@@ -88,31 +94,36 @@ def get_cinic10_dataloaders(
     train_transform_list = []
     test_transform_list = []
 
-    # 1. Resizing (Only needed for pretrained models)
+    # 1. Resizing & Cropping
     if pretrained:
-        # Standard practice for ImageNet models: resize to 256, then crop to 224
-        train_transform_list.extend([
-            transforms.Resize(256),
-            transforms.RandomCrop(target_size)
-        ])
+        train_transform_list.append(transforms.Resize(256))
         test_transform_list.extend([
             transforms.Resize(256),
             transforms.CenterCrop(target_size)
         ])
+        if use_crop:
+            train_transform_list.append(transforms.RandomCrop(target_size))
+        else:
+            # Fallback if crop is disabled: Center crop to maintain 224x224 shape
+            train_transform_list.append(transforms.CenterCrop(target_size))
     else:
-        # Standard practice for 32x32 images
-        train_transform_list.append(transforms.RandomCrop(target_size, padding=4))
-        # No resizing needed for test_transform_list in 32x32 mode
+        if use_crop:
+            train_transform_list.append(transforms.RandomCrop(target_size, padding=4))
+        # No resizing/cropping needed for 32x32 test set
 
     # 2. Standard Operations: Horizontal Flip, Rotation
+    if use_horizontal_flip:
+        train_transform_list.append(transforms.RandomHorizontalFlip())
+
+    if use_rotation:
+        train_transform_list.append(transforms.RandomRotation(15))
+
+    # 3. Tensor Conversion & Normalization
     train_transform_list.extend([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),
         transforms.ToTensor(),
         transforms.Normalize(mean=norm_mean, std=norm_std)
     ])
 
-    # 3. Test/Valid Pipeline completion
     test_transform_list.extend([
         transforms.ToTensor(),
         transforms.Normalize(mean=norm_mean, std=norm_std)
@@ -141,13 +152,25 @@ def get_cinic10_dataloaders(
     valid_dataset = datasets.ImageFolder(root=valid_dir, transform=test_transforms)
     test_dataset = datasets.ImageFolder(root=test_dir, transform=test_transforms)
 
-    # --- Dataset Reduction for Few-Shot Learning ---
-    if train_fraction < 1.0:
-        dataset_size = len(train_dataset)
-        subset_size = int(dataset_size * train_fraction)
-        indices = torch.randperm(dataset_size)[:subset_size].tolist()
-        train_dataset = Subset(train_dataset, indices)
-        print(f"[*] Training dataset reduced to {subset_size} samples (fraction: {train_fraction}).")
+    # --- Dataset Reduction (Few-Shot Learning) ---
+    if samples_per_class is not None:
+        targets = np.array(train_dataset.targets)
+        classes = np.unique(targets)
+        balanced_indices = []
+
+        for c in classes:
+            # Find all indices for class 'c'
+            class_indices = np.where(targets == c)[0]
+            # Safely sample without replacement
+            n_samples = min(samples_per_class, len(class_indices))
+            sampled_indices = np.random.choice(class_indices, n_samples, replace=False)
+            balanced_indices.extend(sampled_indices)
+
+        # Shuffle the final subset to mix classes in batches
+        random.shuffle(balanced_indices)
+        train_dataset = Subset(train_dataset, balanced_indices)
+        train_dataset.classes = train_dataset.dataset.classes
+        print(f"[*] Few-Shot Learning enabled: {len(balanced_indices)} total samples ({samples_per_class} per class).")
 
     # --- Create DataLoaders ---
     # Automatically disable pin_memory for MPS (Mac) to avoid warnings, enable for CUDA

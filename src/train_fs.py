@@ -7,18 +7,16 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+from torchvision.models import resnet34, ResNet34_Weights
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
 from src.utils import get_cinic10_dataloaders, set_seed
-from src.models_implementation.vgg import VGG11
-from src.models_implementation.resnet import FinetunedResNet34
-from src.models_implementation.custom_cnn import CustomCNN
-from src.models_implementation.mobilenet import get_finetuned_mobilenet
 
-# Import Contrastive Models and Loss
+# Import Contrastive Model wrapper and TripletLoss
 from src.models_implementation.fs_contrastive import ContrastiveModel, TripletLoss
 
 
@@ -88,7 +86,7 @@ def get_knn_accuracy(model, train_loader, test_loader, device, k=5):
             _, knn_indices = distances.topk(k, dim=1, largest=False)
 
             # Majority vote: pick the most frequent label per test sample
-            knn_labels   = train_labels[knn_indices]
+            knn_labels     = train_labels[knn_indices]
             predictions, _ = torch.mode(knn_labels, dim=1)
 
             correct += (predictions == labels).sum().item()
@@ -109,7 +107,7 @@ def get_negatives(view, labels):
     """
     B = view.shape[0]
 
-    # diff_mask[i, j] = True  iff  labels[i] != labels[j]  — Shape: [B, B]
+    # diff_mask[i, j] = True  iff  labels[i] != labels[j] — Shape: [B, B]
     diff_mask = labels.unsqueeze(0) != labels.unsqueeze(1)
 
     negatives = torch.zeros_like(view)
@@ -200,31 +198,77 @@ def evaluate_contrastive_fast(model, dataloader, criterion, device, max_batches=
     return (running_loss / total if total > 0 else 0.0), 0.0
 
 
+def build_backbone(model_name, freeze_features):
+    """
+    Loads a pretrained backbone directly from torchvision, removes its
+    classification head, and optionally freezes all feature layers.
+
+    Supported backbones:
+      - mobilenet : MobileNetV2 (ImageNet pretrained)
+      - resnet34  : ResNet-34   (ImageNet pretrained)
+
+    Returns:
+        backbone   : nn.Module with Identity replacing the final FC/classifier
+        in_features: int, dimensionality of the feature vector fed to the projection head
+    """
+    if model_name == 'mobilenet':
+        backbone = mobilenet_v2(weights=MobileNet_V2_Weights.DEFAULT)
+        # MobileNetV2 classifier: Sequential(Dropout, Linear(1280, 1000))
+        # Replace the entire classifier with Identity to expose the 1280-d avg-pooled features
+        backbone.classifier = nn.Identity()
+        in_features = 1280
+
+    elif model_name == 'resnet34':
+        backbone = resnet34(weights=ResNet34_Weights.DEFAULT)
+        # ResNet-34 ends with a single Linear(512, 1000) — replace with Identity
+        backbone.fc = nn.Identity()
+        in_features = 512
+
+    else:
+        raise ValueError(f"Unsupported backbone '{model_name}'. Choose from: mobilenet, resnet34")
+
+    # Freeze all backbone parameters if requested — only the projection head will train
+    if freeze_features:
+        for param in backbone.parameters():
+            param.requires_grad = False
+
+    return backbone, in_features
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Train Few-Shot / Contrastive on CINIC-10")
+    parser = argparse.ArgumentParser(description="Contrastive Few-Shot Learning on CINIC-10")
     parser.add_argument('--model', type=str, default='mobilenet',
-                        choices=['cnn', 'mobilenet', 'vgg11', 'resnet34'])
+                        choices=['mobilenet', 'resnet34'],
+                        help='Pretrained backbone: mobilenet (MobileNetV2) or resnet34 (ResNet-34)')
     parser.add_argument('--freeze_features', action='store_true',
                         help='Freeze the backbone; only the projection head trains')
+
     parser.add_argument('--epochs',       type=int,   default=10)
     parser.add_argument('--batch_size',   type=int,   default=128)
     parser.add_argument('--lr',           type=float, default=0.001)
     parser.add_argument('--weight_decay', type=float, default=0.0)
-    parser.add_argument('--dropout',      type=float, default=0.5,
-                        help='Dropout probability (VGG-11 and Custom CNN only)')
     parser.add_argument('--use_cutout',   action='store_true')
     parser.add_argument('--optimizer',    type=str,   default='adam', choices=['adam', 'sgd'])
+
+    # Few-Shot: how many images per class to use for training
     parser.add_argument('--samples_per_class', type=int, default=None,
-                        help='Images per class — enables few-shot mode')
+                        help='Images per class — enables few-shot mode (e.g. 10, 50)')
+
+    # Augmentation ablation flags
     parser.add_argument('--disable_crop',     action='store_true')
     parser.add_argument('--disable_flip',     action='store_true')
     parser.add_argument('--disable_rotation', action='store_true')
-    parser.add_argument('--margin',           type=float, default=1.0,
-                        help='Margin for TripletLoss')
-    parser.add_argument('--knn_every',        type=int, default=KNN_EVAL_EVERY,
+
+    # Triplet Loss margin — how far negatives must be pushed from the anchor
+    parser.add_argument('--margin', type=float, default=1.0)
+
+    # k-NN evaluation frequency (expensive — runs full forward pass over valid set)
+    parser.add_argument('--knn_every', type=int, default=KNN_EVAL_EVERY,
                         help='Run k-NN evaluation every N epochs (default: 5)')
-    parser.add_argument('--fast_eval_batches', type=int, default=FAST_EVAL_BATCHES,
-                        help='Val batches for fast per-epoch proxy loss (0 = full val set, slow)')
+
+    # Fast val loss: how many batches to use as per-epoch proxy (0 = full val set, slow)
+    parser.add_argument('--fast_eval_batches', type=int, default=FAST_EVAL_BATCHES)
+
     args = parser.parse_args()
 
     # -----------------------------------------------------------------------
@@ -240,7 +284,7 @@ def main():
     fast_eval_batches = args.fast_eval_batches if args.fast_eval_batches > 0 else None
 
     # -----------------------------------------------------------------------
-    # Experiment filename
+    # Experiment filename — encodes all relevant hyperparameters
     # -----------------------------------------------------------------------
     filename = (
         f"CONTRASTIVE_{args.model.upper()}_{args.optimizer}_"
@@ -248,7 +292,7 @@ def main():
     )
     if args.samples_per_class:
         filename += f"{args.samples_per_class}SHOT_"
-    if args.model in ['resnet34', 'mobilenet'] and args.freeze_features:
+    if args.freeze_features:
         filename += "Frozen_"
     if args.weight_decay > 0:
         filename += f"WD{args.weight_decay}_"
@@ -280,9 +324,12 @@ def main():
 
     # -----------------------------------------------------------------------
     # Dataloaders
+    # Both MobileNetV2 and ResNet34 are pretrained on ImageNet (224x224),
+    # so pretrained=True resizes inputs and applies ImageNet normalization.
+    # is_contrastive=True wraps train_loader with TwoCropTransform so that
+    # each batch returns [view1, view2] — two differently augmented versions
+    # of the same images. valid_loader and test_loader remain standard.
     # -----------------------------------------------------------------------
-    is_pretrained_model = args.model in ['resnet34', 'mobilenet']
-
     train_loader, valid_loader, test_loader = get_cinic10_dataloaders(
         data_dir=data_dir,
         batch_size=args.batch_size,
@@ -292,42 +339,28 @@ def main():
         use_horizontal_flip=not args.disable_flip,
         use_rotation=not args.disable_rotation,
         use_cutout=args.use_cutout,
-        is_contrastive=True,        # enables TwoCropTransform on train_loader only
-        pretrained=is_pretrained_model
+        is_contrastive=True,    # enables TwoCropTransform on train_loader only
+        pretrained=True         # always True: both backbones are ImageNet pretrained
     )
 
     # -----------------------------------------------------------------------
-    # Backbone — replace final classifier with Identity to expose features
+    # Backbone — loaded directly from torchvision with pretrained weights.
+    # The final classification head is replaced with Identity to expose
+    # raw feature vectors for the contrastive projection head.
     # -----------------------------------------------------------------------
-    print(f"[*] Initializing backbone: {args.model.upper()}")
+    print(f"[*] Loading pretrained backbone: {args.model.upper()}")
+    backbone, in_features = build_backbone(args.model, args.freeze_features)
 
-    if args.model == 'vgg11':
-        backbone = VGG11(num_classes=10, dropout_rate=args.dropout)
-        backbone.classifier[6] = nn.Identity()
-        in_features = 4096
-    elif args.model == 'resnet34':
-        backbone = FinetunedResNet34(num_classes=10, freeze_features=args.freeze_features)
-        backbone.model.fc = nn.Identity()
-        in_features = 512
-    elif args.model == 'mobilenet':
-        backbone = get_finetuned_mobilenet(num_classes=10, freeze_features=args.freeze_features)
-        backbone.classifier[0] = nn.Identity()
-        in_features = 1280
-    elif args.model == 'cnn':
-        backbone = CustomCNN(num_classes=10, dropout_rate=args.dropout)
-        backbone.fc = nn.Identity()
-        in_features = 512
-
-    # backbone -> Linear(in_features, 128) -> L2 normalize
+    # ContrastiveModel: backbone -> Linear(in_features, 128) -> L2 normalize
     model = ContrastiveModel(backbone=backbone, in_features=in_features, embedding_dim=128)
     model = model.to(device)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
-    print(f"[*] Parameters — Total: {total:,} | Trainable: {trainable:,}")
+    print(f"[*] Parameters | Total: {total:,} | Trainable: {trainable:,}")
 
     # -----------------------------------------------------------------------
-    # Loss & Optimizer
+    # Loss & Optimizer — only trainable parameters are passed to the optimizer
     # -----------------------------------------------------------------------
     criterion  = TripletLoss(margin=args.margin)
     opt_params = filter(lambda p: p.requires_grad, model.parameters())

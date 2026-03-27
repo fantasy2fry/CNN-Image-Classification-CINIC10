@@ -121,6 +121,10 @@ def main():
 
     if args.weight_decay > 0:
         filename += f"{args.weight_decay}_L2_"
+
+    # batch_size to file name:
+    filename += f"{args.batch_size}_BS_"
+
     if args.use_cutout:
         filename += "Cutout_"
 

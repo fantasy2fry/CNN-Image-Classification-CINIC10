@@ -10,9 +10,11 @@ def main():
     parser = argparse.ArgumentParser(description="Generate a leaderboard from experiment CSV files.")
 
     parser.add_argument('--include', nargs='+', default=[],
-                        help='Words that MUST be present in the filename (e.g., VGG11 _BS_)')
+                        help='Words that MUST ALL be present in the filename (AND logic)')
+    parser.add_argument('--include_any', nargs='+', default=[],
+                        help='Words where at least ONE must be present in the filename (OR logic)')
     parser.add_argument('--exclude', nargs='+', default=[],
-                        help='Words that MUST NOT be present in the filename (e.g., PROTONET Cutout)')
+                        help='Words that MUST NOT be present in the filename (NOT logic)')
     parser.add_argument('--filename', type=str, default='experiments_leaderboard.csv',
                         help='Name of the output CSV file for the leaderboard')
     parser.add_argument('--latex', action='store_true',
@@ -43,10 +45,16 @@ def main():
     # ==========================================
     filtered_csv_files = []
     for file in all_csv_files:
+        # AND logic
         has_all_includes = all(word in file for word in args.include)
+
+        # OR logic (jeśli puste, traktujemy jako True, by nie blokować innych filtrów)
+        has_any_include_any = any(word in file for word in args.include_any) if args.include_any else True
+
+        # NOT logic
         has_any_excludes = any(word in file for word in args.exclude)
 
-        if has_all_includes and not has_any_excludes:
+        if has_all_includes and has_any_include_any and not has_any_excludes:
             filtered_csv_files.append(file)
 
     if not filtered_csv_files:
@@ -105,7 +113,7 @@ def main():
     print("\n==========================================================================================")
 
     save_path = os.path.join(experiments_dir, output_filename)
-    #leaderboard_df.to_csv(save_path, index=True)  # Zapisujemy index (Rank) do CSV
+    # leaderboard_df.to_csv(save_path, index=True)  # Zapisujemy index (Rank) do CSV
     print(f"[*] Leaderboard CSV saved to '{save_path}'")
 
     # ==========================================

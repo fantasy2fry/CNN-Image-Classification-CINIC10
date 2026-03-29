@@ -1,4 +1,5 @@
 import os
+import argparse
 import pandas as pd
 import matplotlib.pyplot as plt
 from itertools import combinations
@@ -13,7 +14,24 @@ def clean_label(filename):
 
 
 def main():
-    # 1. Define directory paths
+    # ==========================================
+    # 1. Argument Parser for Filtering
+    # ==========================================
+    parser = argparse.ArgumentParser(description="Generate comparison plots from experiment CSV files.")
+
+    # Example usage: --include VGG11 _BS_ --exclude PROTONET Cutout
+    parser.add_argument('--include', nargs='+', default=[],
+                        help='Words that MUST ALL be present in the filename (AND logic)')
+    parser.add_argument('--include_any', nargs='+', default=[],
+                        help='Words where at least ONE must be present in the filename (OR logic)')
+    parser.add_argument('--exclude', nargs='+', default=[],
+                        help='Words that MUST NOT be present in the filename (NOT logic)')
+
+    args = parser.parse_args()
+
+    # ==========================================
+    # 2. Define directory paths
+    # ==========================================
     experiments_dir = 'experiments'
     plots_dir = 'plots'
 
@@ -25,16 +43,47 @@ def main():
         print(f"[*] Error: Directory '{experiments_dir}' not found!")
         return
 
-    csv_files = [f for f in os.listdir(experiments_dir) if f.endswith('.csv')]
+    # ==========================================
+    # 3. Read and Filter CSV Files
+    # ==========================================
+    all_files = [f for f in os.listdir(experiments_dir) if f.endswith('.csv')]
 
-    if len(csv_files) < 2:
-        print("[*] Error: You need at least 2 .csv files in the 'experiments' folder to create comparison pairs!")
+    # Apply filters
+    filtered_csv_files = []
+    for file in all_files:
+        # Check if ALL 'include' words are in the filename (AND logic)
+        # If args.include is empty, all() naturally returns True
+        has_all_includes = all(word in file for word in args.include)
+
+        # Check if ANY 'include_any' words are in the filename (OR logic)
+        # If args.include_any is empty, we treat it as True so it doesn't block other filters
+        has_any_include_any = any(word in file for word in args.include_any) if args.include_any else True
+
+        # Check if ANY 'exclude' word is in the filename (NOT logic)
+        has_any_excludes = any(word in file for word in args.exclude)
+
+        # Final check: Must pass AND filter, OR filter, and not trigger NOT filter
+        if has_all_includes and has_any_include_any and not has_any_excludes:
+            filtered_csv_files.append(file)
+
+    if len(filtered_csv_files) < 2:
+        print(f"[*] Found only {len(filtered_csv_files)} files matching your criteria.")
+        print("[*] Error: You need at least 2 .csv files to create comparison pairs!")
+        print(f"    Current files in pool: {filtered_csv_files}")
         return
 
-    print(f"[*] Found {len(csv_files)} CSV files. Generating pairs...")
+    print(f"[*] Found {len(filtered_csv_files)} matching CSV files out of {len(all_files)} total.")
+    if args.include:
+        print(f"    - Included (ALL of): {args.include}")
+    if args.include_any:
+        print(f"    - Included (ANY of): {args.include_any}")
+    if args.exclude:
+        print(f"    - Excluded: {args.exclude}")
 
-    # 3. Generate all possible pairs (combinations of 2)
-    pairs = list(combinations(csv_files, 2))
+    # ==========================================
+    # 4. Generate pairs and Plot
+    # ==========================================
+    pairs = list(combinations(filtered_csv_files, 2))
     print(f"[*] Total plots to generate: {len(pairs)}\n")
 
     # 4. Loop through each pair and generate the comparison plot
